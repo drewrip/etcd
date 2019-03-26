@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	pb "go.etcd.io/etcd/raft/raftpb"
+	pb "github.com/drewrip/etcd/raft/raftpb"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -253,6 +253,18 @@ type raft struct {
 
 	Term uint64
 	Vote uint64
+
+	// Whether or not this Raft has been Pinged this term
+	hasBeenPinged bool
+
+	// Timeout to be set. -1 indicates nothing is to be done.
+	revisedTimeout int32
+
+	// When the pinging process has begun
+	pingStartTime time.Time
+
+	// The time the most recent ping message has been recieved
+	pingLastTime time.Time
 
 	readStates []ReadState
 
@@ -554,6 +566,14 @@ func (r *raft) sendHeartbeat(to uint64, ctx []byte) {
 		Context: ctx,
 	}
 
+	if !r.hasBeenPinged{
+		m.Timeout = -1
+	}
+
+	if r.revisedTimeout >= 0 {
+		m.Timeout = r.revisedTimeout
+	}
+
 	r.send(m)
 }
 
@@ -743,6 +763,7 @@ func (r *raft) becomePreCandidate() {
 
 func (r *raft) becomeLeader() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
+	r.hasBeenPinged = false
 	if r.state == StateFollower {
 		panic("invalid transition [follower -> leader]")
 	}
@@ -833,6 +854,7 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 }
 
 func (r *raft) Step(m pb.Message) error {
+
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
 	case m.Term == 0:
@@ -1113,6 +1135,12 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		}
 	case pb.MsgHeartbeatResp:
+		// Assuming a property of the leader called r.pingStartTime and r.pingLastTime. Will be used to calculate duration.
+		if !r.hasBeenPinged && m.Timeout == -2{
+			r.pingLastTime = time.Now()
+			r.logger.Infof("last ping msg recieved by leader %v",r.pingLastTime)
+		}
+
 		pr.RecentActive = true
 		pr.resume()
 
@@ -1322,6 +1350,13 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
+	if m.Timeout == -1{
+		// Signaling the leader that the follower recieved the ping request
+		r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context, Timeout: -2})
+	} else if m.Timeout > 0 {
+		r.electionTimeout = m.Timeout
+		r.resetRandomizedElectionTimeout()
+	}
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
 
